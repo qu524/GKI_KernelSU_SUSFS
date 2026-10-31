@@ -1238,21 +1238,6 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_MAP=y
           EOF
 
-      - name: 添加 Docker-in-LXC 支持配置（最小改动版）
-        working-directory: ${{ env.KERNEL_ROOT }}
-        run: |
-          # 最小改动版：只加"纯新增、不改任何既有结构体"的项，用二分法定位 Run#6 bootloop 的元凶。
-          # 本轮只开 USER_NS / MACVLAN / VXLAN。
-          # 仍严禁 CONFIG_CFS_BANDWIDTH / CONFIG_CGROUP_PIDS（GKI 上必 bootloop）。
-          cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_USER_NS=y
-          CONFIG_MACVLAN=y
-          CONFIG_VXLAN=y
-          EOF
-
-          echo "=== 最小版关键项核对 ==="
-          grep -E '^CONFIG_(USER_NS|MACVLAN|VXLAN|CGROUP_DEVICE|NF_TABLES|BRIDGE_NETFILTER)=' "$DEFCONFIG" || true
-
       - name: 配置内核名称
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
@@ -1483,6 +1468,64 @@ jobs:
               echo "$REL" >> "$REJECTS_DIR/index.txt"
             done
           fi
+
+      - name: KMI 符号证据采集（对照组用，上次就是缺这一步才翻车）
+        working-directory: ${{ env.KERNEL_ROOT }}
+        continue-on-error: true
+        run: |
+          # ============================================================
+          # 上一次翻车的根本原因：只核了"开关开没开"，没核"开完之后
+          # 导出符号有没有变"。GKI 冻结 ABI，厂商的 WiFi / 蓝牙 / 基带
+          # 是预编译好的 .ko，加载时内核逐个核对导出符号的 CRC，
+          # 对不上就拒载 -> 驱动起不来 -> bootloop。
+          #
+          # 本轮同时编译两条分支做对照：
+          #   v/base   —— 不加任何东西（= 已知能开机的那一版）
+          #   v/userns —— 只加 CONFIG_USER_NS
+          # 两条都把 Module.symvers 存成产物，下载回来逐行比对 CRC。
+          # 只要有任何【两边共有符号】的 CRC 不同，就说明 ABI 被改动了，
+          # 厂商模块会拒载 -> 必 bootloop。这个判断不靠猜。
+          # ============================================================
+          SYMVERS=$(find . -name Module.symvers | head -1)
+          echo "Module.symvers: ${SYMVERS:-未找到}"
+
+          mkdir -p "$GITHUB_WORKSPACE/kmi-evidence"
+          if [ -n "$SYMVERS" ]; then
+            echo "符号总行数: $(wc -l < "$SYMVERS")"
+
+            # 官方冻结的 KMI 符号清单，检查有没有被吃掉
+            ABI=$(find . -path '*android*' -name 'abi_gki_aarch64*' 2>/dev/null | head -1)
+            echo "官方 ABI 清单文件: ${ABI:-未找到}"
+            if [ -n "$ABI" ]; then
+              MISSING=0
+              while read -r s; do
+                [ -z "$s" ] && continue
+                grep -qE "[[:space:]]${s}\$" "$SYMVERS" || { echo "  缺失符号: $s"; MISSING=$((MISSING+1)); }
+              done < <(grep -v '^#' "$ABI" 2>/dev/null | awk '{print $1}' | grep -v '^$' | sort -u)
+              echo "官方 KMI 符号缺失数: $MISSING  (0 = 符号一个没少)"
+            fi
+
+            # 存证据：符号名 + CRC，排序后算指纹，方便两条分支直接对比
+            cp "$SYMVERS" "$GITHUB_WORKSPACE/kmi-evidence/Module.symvers"
+            awk '{print $2, $1}' "$SYMVERS" | sort > "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt"
+            echo "参与比对的 (CRC 符号名) 行数: $(wc -l < "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt")"
+            echo "指纹 sha256: $(sha256sum "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt" | awk '{print $1}')"
+          fi
+
+          # 最终 .config 也留一份，用于核对实际编进去的配置
+          find . -maxdepth 3 -name '.config' | head -3
+          for c in $(find . -maxdepth 3 -name '.config' | head -1); do
+            cp "$c" "$GITHUB_WORKSPACE/kmi-evidence/final.config" 2>/dev/null || true
+          done
+          echo "证据目录内容:"; ls -la "$GITHUB_WORKSPACE/kmi-evidence"
+
+      - name: 上传 KMI 证据
+        uses: actions/upload-artifact@v6
+        with:
+          name: KMI-evidence-${{ inputs.sub_level }}
+          path: kmi-evidence
+          compression-level: 9
+          if-no-files-found: warn
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v6
