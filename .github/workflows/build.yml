@@ -1238,20 +1238,105 @@ jobs:
           CONFIG_KSU_SUSFS_SUS_MAP=y
           EOF
 
-      - name: 添加 Docker-in-LXC 支持配置（最小改动版）
+      - name: 补上 CONFIG_USER_NS（严格按 Droidspaces 官方 GKI 规范）
         working-directory: ${{ env.KERNEL_ROOT }}
         run: |
-          # 最小改动版：只加"纯新增、不改任何既有结构体"的项，用二分法定位 Run#6 bootloop 的元凶。
-          # 本轮只开 USER_NS / MACVLAN / VXLAN。
-          # 仍严禁 CONFIG_CFS_BANDWIDTH / CONFIG_CGROUP_PIDS（GKI 上必 bootloop）。
-          cat >> "$DEFCONFIG" << 'EOF'
-          CONFIG_USER_NS=y
-          CONFIG_MACVLAN=y
-          CONFIG_VXLAN=y
-          EOF
+          set -e
+          # ============================================================
+          # 依据：Droidspaces 官方文档 Kernel-Configuration.md
+          #       https://github.com/ravindu644/Droidspaces-OSS/blob/main/Documentation/Kernel-Configuration.md
+          #       章节：## GKI kernels (5.4 and newer) -> Step 2: Edit the GKI defconfig
+          #
+          # 文档把配置分成【两个互斥章节】，不能混用：
+          #   - Non-GKI kernels (3.18 to 4.19)：这些内核 "take the options as they are,
+          #     with no ABI to protect" —— 所以那里才有 CGROUP_DEVICE / BRIDGE_NETFILTER /
+          #     NF_TABLES / CFS_BANDWIDTH / CGROUP_PIDS 等一大堆。
+          #   - GKI kernels (5.4 and newer)：ABI 是冻结的，只能用 Step 2 那一份清单。
+          #
+          # 上次翻车的根因：我把 Non-GKI 章节的选项抄进了 GKI 构建。
+          # 官方文档的警告原文：
+          #   "These options are ABI-safe together with the Step 1 patches.
+          #    Do not turn on anything beyond them."
+          #
+          # 官方 GKI Step 2 完整清单（必需 6 项）：
+          #   SYSVIPC / POSIX_MQUEUE / IPC_NS / PID_NS / DEVTMPFS /
+          #   NETFILTER_XT_MATCH_ADDRTYPE
+          # 官方 GKI Step 2 可选但推荐：
+          #   USER_NS / IP6_NF_NAT / IP6_NF_TARGET_MASQUERADE / MACVLAN /
+          #   NETFILTER_XT_TARGET_REJECT / NETFILTER_XT_TARGET_LOG /
+          #   NETFILTER_XT_MATCH_RECENT / IP_SET / IP_SET_HASH_IP /
+          #   IP_SET_HASH_NET / NETFILTER_XT_SET / TMPFS_POSIX_ACL / TMPFS_XATTR
+          # 官方明确注释掉、禁止开启：
+          #   CFS_BANDWIDTH / CGROUP_PIDS
+          #
+          # ---------- 本轮只加 USER_NS 一个，理由（不是猜，是实测）----------
+          # 1) 用户机器上实测能开机、WiFi 正常的 Wild 内核（同为 5.15.170、
+          #    同 vermagic），其 IKCONFIG 里 USER_NS=y，而 MACVLAN /
+          #    CGROUP_DEVICE / BRIDGE_NETFILTER / NF_TABLES 全部未设置。
+          #    => USER_NS 单独开，在这台机器上是【已现场验证安全】的。
+          # 2) 用户之前刷的 GOOD-4in1-170（无 USER_NS）跑 Droidspaces
+          #    Requirements 自检时，【只有 User namespace 一项是红的】，
+          #    其余全绿。=> 补上 USER_NS 后自检应全绿，不需要别的。
+          # 3) 官方 probe 表：User namespaces -> CONFIG_USER_NS
+          #    "Without it: Allow Sandboxing is unavailable."
+          #    官方注释也写明它是 "Fix for docker unsafe procfs error"。
+          # ============================================================
 
-          echo "=== 最小版关键项核对 ==="
-          grep -E '^CONFIG_(USER_NS|MACVLAN|VXLAN|CGROUP_DEVICE|NF_TABLES|BRIDGE_NETFILTER)=' "$DEFCONFIG" || true
+          DEFCONFIG_PATH="${DEFCONFIG:-$KERNEL_ROOT/common/arch/arm64/configs/gki_defconfig}"
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            DEFCONFIG_PATH=$(find . -name gki_defconfig -path '*arm64*' | head -1)
+          fi
+          echo "defconfig: $DEFCONFIG_PATH"
+          test -f "$DEFCONFIG_PATH" || { echo "找不到 defconfig，中止"; exit 1; }
+          cp "$DEFCONFIG_PATH" /tmp/defconfig.before
+
+          # 官方要求：就地改 defconfig，而不是追加 fragment
+          #   "Edit arch/arm64/configs/gki_defconfig in place rather than
+          #    adding a fragment. For each option below, find it in the file:
+          #    change '# CONFIG_X is not set' to 'CONFIG_X=y', leave it alone
+          #    if it is already on, and add it at the end if it is absent."
+          set_opt() {
+            local k="$1" v="$2"
+            if grep -q "^CONFIG_${k}=" "$DEFCONFIG_PATH"; then
+              sed -i "s|^CONFIG_${k}=.*|CONFIG_${k}=${v}|" "$DEFCONFIG_PATH"
+            elif grep -q "^# CONFIG_${k} is not set" "$DEFCONFIG_PATH"; then
+              sed -i "s|^# CONFIG_${k} is not set|CONFIG_${k}=${v}|" "$DEFCONFIG_PATH"
+            else
+              echo "CONFIG_${k}=${v}" >> "$DEFCONFIG_PATH"
+            fi
+          }
+
+          set_opt USER_NS y
+
+          # 双保险：官方禁止的两项必须是关的
+          sed -i "s|^CONFIG_CFS_BANDWIDTH=.*|# CONFIG_CFS_BANDWIDTH is not set|" "$DEFCONFIG_PATH"
+          sed -i "s|^CONFIG_CGROUP_PIDS=.*|# CONFIG_CGROUP_PIDS is not set|" "$DEFCONFIG_PATH"
+
+          echo
+          echo "############ 本版 defconfig 核对（对照官方 GKI Step 2 清单）############"
+          echo "--- 官方必需 6 项（必须全 y）---"
+          for k in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE; do
+            printf '  %-34s %s\n' "$k" "$(grep -m1 "^CONFIG_${k}=" "$DEFCONFIG_PATH" || echo '!! 缺失')"
+          done
+          echo "--- 本轮新增 ---"
+          printf '  %-34s %s\n' "USER_NS" "$(grep -m1 '^CONFIG_USER_NS=' "$DEFCONFIG_PATH" || echo '!! 没加上')"
+          echo "--- 官方禁止 2 项（必须是 is not set）---"
+          printf '  %-34s %s\n' "CFS_BANDWIDTH" "$(grep -m1 'CFS_BANDWIDTH' "$DEFCONFIG_PATH" || echo '未出现(好)')"
+          printf '  %-34s %s\n' "CGROUP_PIDS" "$(grep -m1 'CGROUP_PIDS' "$DEFCONFIG_PATH" || echo '未出现(好)')"
+          echo "--- 上次翻车的越界项（必须都没开）---"
+          for k in CGROUP_DEVICE BRIDGE_NETFILTER NF_TABLES VXLAN CGROUP_NET_CLASSID \
+                   NETFILTER_XT_MATCH_PHYSDEV NETFILTER_XT_TARGET_CHECKSUM IP_SET_BITMAP_IP \
+                   OVERLAY_FS_REDIRECT_DIR; do
+            # 注意：工作流用 bash -e 执行，grep 没匹配时返回 1，
+            # 而【变量赋值语句的退出码 = 命令替换的退出码】，会直接让整个步骤失败。
+            # 上一步 Build 就是这样被自己写死的（配置其实已经改对了）。
+            v=$(grep -m1 "^CONFIG_${k}=" "$DEFCONFIG_PATH" || true)
+            printf '  %-34s %s\n' "$k" "${v:-未设置(正确)}"
+          done
+          echo "############################################################"
+          echo
+          echo "=== 与修改前的 diff（应当只有 USER_NS 一行）==="
+          diff /tmp/defconfig.before "$DEFCONFIG_PATH" || true
 
       - name: 配置内核名称
         working-directory: ${{ env.KERNEL_ROOT }}
@@ -1483,6 +1568,64 @@ jobs:
               echo "$REL" >> "$REJECTS_DIR/index.txt"
             done
           fi
+
+      - name: KMI 符号证据采集（对照组用，上次就是缺这一步才翻车）
+        working-directory: ${{ env.KERNEL_ROOT }}
+        continue-on-error: true
+        run: |
+          # ============================================================
+          # 上一次翻车的根本原因：只核了"开关开没开"，没核"开完之后
+          # 导出符号有没有变"。GKI 冻结 ABI，厂商的 WiFi / 蓝牙 / 基带
+          # 是预编译好的 .ko，加载时内核逐个核对导出符号的 CRC，
+          # 对不上就拒载 -> 驱动起不来 -> bootloop。
+          #
+          # 本轮同时编译两条分支做对照：
+          #   v/base   —— 不加任何东西（= 已知能开机的那一版）
+          #   v/userns —— 只加 CONFIG_USER_NS
+          # 两条都把 Module.symvers 存成产物，下载回来逐行比对 CRC。
+          # 只要有任何【两边共有符号】的 CRC 不同，就说明 ABI 被改动了，
+          # 厂商模块会拒载 -> 必 bootloop。这个判断不靠猜。
+          # ============================================================
+          SYMVERS=$(find . -name Module.symvers | head -1)
+          echo "Module.symvers: ${SYMVERS:-未找到}"
+
+          mkdir -p "$GITHUB_WORKSPACE/kmi-evidence"
+          if [ -n "$SYMVERS" ]; then
+            echo "符号总行数: $(wc -l < "$SYMVERS")"
+
+            # 官方冻结的 KMI 符号清单，检查有没有被吃掉
+            ABI=$(find . -path '*android*' -name 'abi_gki_aarch64*' 2>/dev/null | head -1)
+            echo "官方 ABI 清单文件: ${ABI:-未找到}"
+            if [ -n "$ABI" ]; then
+              MISSING=0
+              while read -r s; do
+                [ -z "$s" ] && continue
+                grep -qE "[[:space:]]${s}\$" "$SYMVERS" || { echo "  缺失符号: $s"; MISSING=$((MISSING+1)); }
+              done < <(grep -v '^#' "$ABI" 2>/dev/null | awk '{print $1}' | grep -v '^$' | sort -u)
+              echo "官方 KMI 符号缺失数: $MISSING  (0 = 符号一个没少)"
+            fi
+
+            # 存证据：符号名 + CRC，排序后算指纹，方便两条分支直接对比
+            cp "$SYMVERS" "$GITHUB_WORKSPACE/kmi-evidence/Module.symvers"
+            awk '{print $2, $1}' "$SYMVERS" | sort > "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt"
+            echo "参与比对的 (CRC 符号名) 行数: $(wc -l < "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt")"
+            echo "指纹 sha256: $(sha256sum "$GITHUB_WORKSPACE/kmi-evidence/sym-crc-sorted.txt" | awk '{print $1}')"
+          fi
+
+          # 最终 .config 也留一份，用于核对实际编进去的配置
+          find . -maxdepth 3 -name '.config' | head -3
+          for c in $(find . -maxdepth 3 -name '.config' | head -1); do
+            cp "$c" "$GITHUB_WORKSPACE/kmi-evidence/final.config" 2>/dev/null || true
+          done
+          echo "证据目录内容:"; ls -la "$GITHUB_WORKSPACE/kmi-evidence"
+
+      - name: 上传 KMI 证据
+        uses: actions/upload-artifact@v6
+        with:
+          name: KMI-evidence-${{ inputs.sub_level }}
+          path: kmi-evidence
+          compression-level: 9
+          if-no-files-found: warn
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v6
