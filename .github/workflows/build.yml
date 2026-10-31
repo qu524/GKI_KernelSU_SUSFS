@@ -766,6 +766,120 @@ jobs:
             fi
           fi
 
+      - name: 修复 SUSFS 5.15 task_mmu/namespace 头部 hunk 失配
+        run: |
+          echo "=== 修复 SUSFS 补丁在 5.15 上头部 hunk 失配（task_mmu.c / namespace.c）==="
+          if [ -d "${KERNEL_ROOT}/common/fs/proc" ]; then
+            cd "${KERNEL_ROOT}/common"
+          elif [ -d "${KERNEL_ROOT}/fs/proc" ]; then
+            cd "${KERNEL_ROOT}"
+          else
+            echo "::warning::未定位到内核源码根目录，跳过修复"
+            exit 0
+          fi
+          echo "工作目录: $(pwd)"
+          python3 - <<'PYEOF'
+          import os
+
+          NL = chr(10)
+
+          # 内容完全照抄 SUSFS 官方补丁
+          # 50_add_susfs_in_gki-android13-5.15.patch 里对应文件的第一个 hunk。
+          # 该 hunk 在 5.15 上因上下文偏移打不上，但补丁其余 hunk 都成功了。
+          #
+          # 注意：判据必须区分「定义」与「使用」。
+          # 例如 CL_COPY_MNT_NS 在 namespace.c 里被大量使用（if (flag & CL_COPY_MNT_NS)），
+          # 用它判断"是否已修复"会误判为已完成。必须查 '#define CL_COPY_MNT_NS'。
+
+          def first_include_block_end(lines):
+              last = None
+              for i, l in enumerate(lines):
+                  s = l.strip()
+                  if s.startswith("#include"):
+                      last = i
+                      continue
+                  if s == "" or s.startswith("/*") or s.startswith("*") or s.startswith("//") or s.startswith("#"):
+                      continue
+                  if last is not None:
+                      break
+              return last
+
+          def build_namespace_block(src):
+              """只补缺的那一块，避免重复定义。"""
+              parts = []
+              if "susfs_def.h" not in src:
+                  parts.append(NL.join([
+                      "#ifdef CONFIG_KSU_SUSFS",
+                      "#include <linux/susfs_def.h>",
+                      "#endif // #ifdef CONFIG_KSU_SUSFS",
+                  ]))
+              inner = []
+              if "extern bool susfs_is_current_ksu_domain" not in src:
+                  inner.append("extern bool susfs_is_current_ksu_domain(void);")
+              if "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted" not in src:
+                  inner.append("extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;")
+              if "#define CL_COPY_MNT_NS" not in src:
+                  if inner:
+                      inner.append("")
+                  inner.append("#define CL_COPY_MNT_NS BIT(25) /* used by copy_mnt_ns() */")
+              if inner:
+                  parts.append(NL.join(["#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT"]
+                                       + inner
+                                       + ["#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT"]))
+              return NL.join(parts)
+
+          def build_taskmmu_block(src):
+              if "susfs_def.h" in src:
+                  return ""
+              return NL.join([
+                  "#if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)",
+                  "#include <linux/susfs_def.h>",
+                  "#endif // #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)",
+              ])
+
+          targets = [
+              ("fs/proc/task_mmu.c",
+               ["SUSFS_IS_INODE_SUS_MAP", "SUSFS_IS_INODE_OPEN_REDIRECT", "SUSFS_SUS_KSTAT"],
+               build_taskmmu_block),
+              ("fs/namespace.c",
+               ["susfs_mnt_id_ida", "DEFAULT_KSU_MNT_ID", "susfs_is_current_ksu_domain"],
+               build_namespace_block),
+          ]
+
+          changed = 0
+          for path, markers, builder in targets:
+              if not os.path.isfile(path):
+                  print("skip (not found):", path)
+                  continue
+              with open(path, "r") as f:
+                  src = f.read()
+              if not any(m in src for m in markers):
+                  print("no susfs usage detected, skip:", path)
+                  continue
+              block = builder(src)
+              if not block:
+                  print("already complete, skip:", path)
+                  continue
+              lines = src.splitlines()
+              pos = first_include_block_end(lines)
+              if pos is None:
+                  print("no include block found, skip:", path)
+                  continue
+              lines.insert(pos + 1, block)
+              with open(path, "w") as f:
+                  f.write(NL.join(lines) + NL)
+              changed += 1
+              print("INJECTED after line %d -> %s" % (pos + 1, path))
+              for bl in block.splitlines():
+                  print("    + " + bl)
+
+          print("changed files:", changed)
+          PYEOF
+          echo "--- 校验：必须同时看到 include / extern / define ---"
+          grep -n "susfs_def.h" fs/proc/task_mmu.c fs/namespace.c || echo "::warning::缺 include"
+          grep -n "extern bool susfs_is_current_ksu_domain" fs/namespace.c || echo "::warning::缺 extern"
+          grep -n "#define CL_COPY_MNT_NS" fs/namespace.c || echo "::warning::缺 define"
+
       - name: 克隆 Droidspaces 补丁仓库
         if: inputs.droidspaces != 'off'
         run: |
@@ -1123,6 +1237,21 @@ jobs:
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_SUS_MAP=y
           EOF
+
+      - name: 添加 Docker-in-LXC 支持配置（最小改动版）
+        working-directory: ${{ env.KERNEL_ROOT }}
+        run: |
+          # 最小改动版：只加"纯新增、不改任何既有结构体"的项，用二分法定位 Run#6 bootloop 的元凶。
+          # 本轮只开 USER_NS / MACVLAN / VXLAN。
+          # 仍严禁 CONFIG_CFS_BANDWIDTH / CONFIG_CGROUP_PIDS（GKI 上必 bootloop）。
+          cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_USER_NS=y
+          CONFIG_MACVLAN=y
+          CONFIG_VXLAN=y
+          EOF
+
+          echo "=== 最小版关键项核对 ==="
+          grep -E '^CONFIG_(USER_NS|MACVLAN|VXLAN|CGROUP_DEVICE|NF_TABLES|BRIDGE_NETFILTER)=' "$DEFCONFIG" || true
 
       - name: 配置内核名称
         working-directory: ${{ env.KERNEL_ROOT }}
